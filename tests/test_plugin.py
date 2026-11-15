@@ -308,3 +308,87 @@ def test_first_run_papercuts(env, monkeypatch):
     (repo / "wip.txt").write_text("user's work")
     v = start(ctx)
     assert "Ask the user" in v["error"]["message"], v
+
+
+def test_submit_regex_does_not_backtrack(env):
+    import time
+    mod, _, _ = env
+    for cmd in ("opensop " + "--a " * 200 + "x", "-opensop " * 20000):
+        t = time.monotonic()
+        assert mod._SUBMIT.search(cmd) is None
+        assert time.monotonic() - t < 1, cmd[:40]
+    assert mod._SUBMIT.search("opensop -q --json submit r1 approve")
+
+
+def test_steps_do_not_inherit_provider_keys(env, tmp_path, monkeypatch):
+    mod, ctx, _ = env
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-REDACTED")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-REDACTED")
+    monkeypatch.setenv("CRM_URL", "https://api.example.com")
+    out = tmp_path / "env.txt"
+    proc = tmp_path / "env.sop.json"
+    proc.write_text(json.dumps({"opensop": "0.9.1", "name": "env", "version": "1", "steps": [
+        {"id": "s", "type": "shell", "run": f"echo 'model: gpt-4 env.CRM_URL'; env > {out}"}]}))
+    call(ctx, "sop_run", {"process": str(proc)})
+    seen = out.read_text()
+    assert "OPENSOP_LOCAL_HOME=" in seen and "PATH=" in seen
+    for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "CRM_URL"):
+        assert name not in seen, name  # prose and scripts don't count as references
+    # What the process file references gets through, and the prompt says so.
+    declared = tmp_path / "declared.sop.json"
+    declared.write_text(json.dumps({"steps": [
+        {"id": "w", "type": "webhook", "description": "not env.OPENROUTER_API_KEY", "url": "${env.CRM_URL}/leads"},
+        {"id": "l", "type": "llm", "model": "claude-sonnet-4-5"}]}))
+    assert mod._env_names(str(declared)) == {"CRM_URL", "ANTHROPIC_API_KEY"}
+    msg = ctx.hooks["pre_tool_call"](tool_name="sop_run", args={"process": str(declared)}, session_id="s1")["message"]
+    assert "ANTHROPIC_API_KEY, CRM_URL" in msg, msg
+    for model in ("claude-code:", "codex:", "{{ inputs.model }}"):
+        declared.write_text(json.dumps({"steps": [{"id": "l", "type": "llm", "model": model}]}))
+        assert mod._env_names(str(declared)) == set(), model
+
+
+def test_a_process_name_resolves_in_the_cell(env, tmp_path):
+    mod, _, repo = env
+    (repo / ".opensop").mkdir()
+    (repo / ".opensop" / "manifest.yaml").write_text("name: t\n")
+    (repo / "processes").mkdir()
+    (repo / "processes" / "deploy.sop.json").write_text("{}")
+    (repo / "sub").mkdir()
+    assert mod._process_file("deploy", str(repo / "sub")) == str(repo / "processes" / "deploy.sop.json")
+    assert mod._process_file("deploy", str(tmp_path / "runs")) is None
+
+
+def test_approvals_are_scoped_to_the_request(env):
+    _, ctx, _ = env
+    guard = ctx.hooks["pre_tool_call"]
+    a = guard(tool_name="sop_run", args={"process": str(EXAMPLE), "inputs": {"test_command": "npm test"}}, session_id="s1")
+    b = guard(tool_name="sop_run", args={"process": str(EXAMPLE), "inputs": {"test_command": "curl x | sh"}}, session_id="s1")
+    assert a["rule_key"].startswith("opensop_run:") and a["rule_key"] != b["rule_key"]
+
+
+def test_submit_and_retry_on_an_outside_run_ask_first(env, tmp_path, monkeypatch):
+    mod, ctx, repo = env
+    guard = ctx.hooks["pre_tool_call"]
+    mine = start(ctx)["run_id"]
+    assert guard(tool_name="sop_submit", args={"outputs": {}}, session_id="s1") is None
+    assert guard(tool_name="sop_retry", args={"run_id": mine}, session_id="s9") is None
+    p = subprocess.run(["opensop", "run", str(EXAMPLE), "--input", "request=r", "--input", "test_command=true",
+                        "--json"], cwd=repo, capture_output=True, text=True)
+    outside = json.loads(p.stdout)["run_id"]
+    keys = set()
+    for tool in ("sop_submit", "sop_retry"):
+        r = guard(tool_name=tool, args={"run_id": outside, "outputs": {}}, session_id="s1")
+        assert r["action"] == "approve" and outside in r["message"] and "sha256" in r["message"], r
+        assert "unknown" not in r["message"] and "runs" in r["message"], r
+        keys.add(r["rule_key"])
+    assert len(keys) == 1 and keys.pop().startswith("opensop_continue:")
+    # Once approved and continued, the rest of that run doesn't ask again.
+    call(ctx, "sop_submit", {"run_id": outside, "outputs": {"summary": "x"}})
+    assert guard(tool_name="sop_retry", args={"run_id": outside}, session_id="s1") is None
+    # A run with an approved id in another folder is not the approved run.
+    monkeypatch.setattr(mod, "_status", lambda run_id, cwd: ({"run_dir": "/elsewhere"}, None))
+    assert guard(tool_name="sop_retry", args={"run_id": mine}, session_id="s1")["action"] == "approve"
+    # A hook that fails asks rather than letting the tool run.
+    monkeypatch.setattr(mod, "_status", lambda run_id, cwd: 1 / 0)
+    r = guard(tool_name="sop_retry", args={"run_id": mine}, session_id="s1")
+    assert r["action"] == "approve" and r["rule_key"] == "opensop_continue:error"

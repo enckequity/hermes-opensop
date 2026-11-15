@@ -19,7 +19,7 @@ import tempfile
 from tools.registry import tool_error, tool_result
 
 TOOLSET = "opensop"
-CLI_TIMEOUT_S = int(os.environ.get("OPENSOP_HERMES_TIMEOUT", "1800"))
+CLI_TIMEOUT_S = 1800  # default for the `timeout` setting
 STATUS_TIMEOUT_S = 20  # hooks call status every turn; a wedged CLI must not stall the turn
 HUMAN_REASONS = {"waiting_for_approval", "escalated"}
 # Waits the agent can't act on: a person's decision, or an outside callback.
@@ -59,16 +59,92 @@ def _cli():
     return _cli_checked
 
 
-def _opensop(args, cwd, timeout=None):
+def _timeout():
+    try:
+        return int(_ctx.get_config("timeout", CLI_TIMEOUT_S))
+    except Exception:
+        return CLI_TIMEOUT_S
+
+
+_ENV_BASE = {"PATH", "HOME", "LANG", "TMPDIR", "SSH_AUTH_SOCK"}
+_PROSE = {"description", "prompt", "run", "title", "summary", "name"}  # text, not references
+_ENV_REF = re.compile(r"(?<![\w.])env\.([A-Za-z_]\w*)")  # env.X and ${env.X}
+
+
+def _env_names(process_file):
+    """The variables a process file needs: its env.X references, and ANTHROPIC_API_KEY for an
+    llm/judgment step on a claude* model (the CLI calls the Anthropic API itself for those)."""
+    try:
+        with open(process_file, encoding="utf-8") as f:
+            todo = [json.load(f)]
+    except (OSError, TypeError, ValueError):
+        return set()  # local runs take JSON only; the CLI reports a bad file itself
+    names = set()
+    while todo:
+        node = todo.pop()
+        if isinstance(node, list):
+            todo.extend(node)
+        elif isinstance(node, dict):
+            model = node.get("model")
+            if (node.get("type") in ("llm", "judgment") and isinstance(model, str)
+                    and model.startswith("claude") and not model.startswith("claude-code:")):
+                names.add("ANTHROPIC_API_KEY")
+            todo.extend(v for k, v in node.items() if k not in _PROSE)
+        elif isinstance(node, str):
+            names.update(_ENV_REF.findall(node))
+    return names
+
+
+def _env(names=()):
+    """The environment opensop runs with: the basics, OPENSOP_*, and the names the process
+    file needs. Script steps and the agent CLIs they drive don't get Hermes's provider keys."""
+    keep = _ENV_BASE | set(names)
+    return {k: v for k, v in os.environ.items() if k in keep or k.startswith(("LC_", "OPENSOP_"))}
+
+
+def _forwarded(names):
+    """For approval prompts: which of the process file's variables it will receive."""
+    have = sorted(n for n in names if n in os.environ)
+    return f" It receives {', '.join(have)} from your environment." if have else ""
+
+
+def _process_file(process, cwd):
+    """The file `opensop run <process>` runs: a path, or a name in the nearest cell's processes/."""
+    if process.endswith((".json", ".yaml", ".yml")) or "/" in process or os.path.isfile(os.path.join(cwd, process)):
+        return os.path.join(cwd, process)
+    d = os.path.abspath(cwd)
+    while True:
+        if os.path.isfile(os.path.join(d, ".opensop", "manifest.yaml")):
+            # ponytail: nearest cell only; the CLI also searches that cell's declared ancestors
+            return os.path.join(d, "processes", process + ".sop.json")
+        if d == os.path.dirname(d):
+            return None
+        d = os.path.dirname(d)
+
+
+def _snapshot(run_dir):
+    return os.path.join(run_dir, "process.snapshot.json") if run_dir else None
+
+
+def _digest(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except (OSError, TypeError):
+        return "unknown"
+
+
+def _opensop(args, cwd, timeout=None, process_file=None):  # process_file: whose env.X names to pass
     """Run `opensop <args> --json` in cwd. Returns (dict, error-string)."""
-    timeout = timeout or CLI_TIMEOUT_S
+    timeout = timeout or _timeout()
     exe, err = _cli()
     if err:
         return None, err
     try:
         # Own process group, so a timeout stops the step's children too.
         proc = subprocess.Popen([exe, *args, "--json"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
+                                stdin=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True,
+                                env=_env(_env_names(process_file)))
     except OSError as e:
         return None, f"opensop could not start: {e}"
     try:
@@ -151,6 +227,15 @@ def _unbind(session_id):
         _state.set(_key(session_id), None)
 
 
+def _approved_key(run_id):
+    return "approved:" + hashlib.sha256(str(run_id).encode()).hexdigest()
+
+
+def _approved(run_id, run_dir):
+    """Whether this profile approved the run living in run_dir (a run of the same id elsewhere is not it)."""
+    return _state is not None and bool(run_dir) and _state.get(_approved_key(run_id)) == run_dir
+
+
 def _session_cwd():
     """The calling session's working directory. Hooks and tools run in the gateway, whose own cwd is not it."""
     try:
@@ -175,9 +260,12 @@ def _resolve(args, kwargs):
     return run_id, cwd
 
 
-def _after(run_id, cwd, session_id):
-    """Status after an action; bind this session to the run while it is open."""
+def _after(run_id, cwd, session_id, approved=False):
+    """Status after an action; bind this session to the run while it is open. approved: the
+    action went through the approval gate, so later submits and retries of this run don't ask."""
     st, err = _status(run_id, cwd)
+    if approved and _state is not None and st and st.get("run_dir"):
+        _state.set(_approved_key(run_id), st["run_dir"])
     if err:
         if "no such local run" in err:
             err += (" Runs live in OPENSOP_LOCAL_HOME, the nearest .opensop/ folder above the working "
@@ -202,12 +290,13 @@ def sop_run(args, **kwargs):
         return tool_error('inputs must be a JSON object, like {"request": "..."}')
     cwd = _workdir(args)
     with _json_file(inputs) as path:
-        out, err = _opensop(["run", process, "--inputs-file", path], cwd)
+        out, err = _opensop(["run", process, "--inputs-file", path], cwd,
+                            process_file=_process_file(process, cwd))
     if err:
         return tool_error(err)
     if not out.get("run_id"):
         return tool_error("opensop run did not start a run", output=json.dumps(out)[:500])
-    return _after(out["run_id"], cwd, kwargs.get("session_id"))
+    return _after(out["run_id"], cwd, kwargs.get("session_id"), approved=True)
 
 
 def sop_status(args, **kwargs):
@@ -245,20 +334,24 @@ def sop_submit(args, **kwargs):
     if not isinstance(outputs, dict):
         return tool_error('outputs must be a JSON object, like {"summary": "..."}', run_id=run_id)
     with _json_file(outputs) as path:
-        _, err = _opensop(["submit", run_id, step, "--outputs-file", path, "--decided-by", DECIDED_BY], cwd)
+        _, err = _opensop(["submit", run_id, step, "--outputs-file", path, "--decided-by", DECIDED_BY], cwd,
+                          process_file=_snapshot(st.get("run_dir")))
     if err:
         return tool_error(err, run_id=run_id)
-    return _after(run_id, cwd, kwargs.get("session_id"))
+    return _after(run_id, cwd, kwargs.get("session_id"), approved=True)
 
 
 def sop_retry(args, **kwargs):
     run_id, cwd = _resolve(args, kwargs)
     if not run_id:
         return tool_error("no run_id given and this session has no open run")
-    _, err = _opensop(["heal", run_id, "--apply"], cwd)
+    st, err = _status(run_id, cwd)
     if err:
         return tool_error(err, run_id=run_id)
-    return _after(run_id, cwd, kwargs.get("session_id"))
+    _, err = _opensop(["heal", run_id, "--apply"], cwd, process_file=_snapshot(st.get("run_dir")))
+    if err:
+        return tool_error(err, run_id=run_id)
+    return _after(run_id, cwd, kwargs.get("session_id"), approved=True)
 
 
 class _json_file:
@@ -354,7 +447,9 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
     return None
 
 
-_SUBMIT = re.compile(r"\bopensop\b['\"]?(?:\s+--?\S+)*\s+submit\b([^;&|\n]*)")
+# Each flag matches one way only (`-\S*`), and at most 32 of them, so this stays linear on every
+# terminal command (`-opensop -opensop …` would otherwise rescan the rest from each word).
+_SUBMIT = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+submit\b([^;&|\n]*)")
 _VALUE_FLAGS = {"--output", "--outputs", "--outputs-file", "--decided-by", "--server"}
 
 
@@ -385,17 +480,40 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
         return None
     if tool_name == "sop_run":
         # Script steps run as shell commands outside Hermes's terminal approvals: ask once per run.
-        # The message names the inputs and the file's hash; Hermes keys "always"/"session" on it,
-        # so a new input or a changed process file asks again.
+        # rule_key is the file, its hash and the inputs, so "session"/"always" covers this exact
+        # run request and a new input or a changed process file asks again.
         process = _path(str(args.get("process") or ""))
+        cwd = _workdir(args)
+        file = _process_file(process, cwd)
+        digest = _digest(file)
+        inputs = json.dumps(args.get("inputs") or {}, sort_keys=True)
+        key = hashlib.sha256(json.dumps([file or process, digest, inputs]).encode()).hexdigest()[:16]
+        shown = "" if digest == "unknown" else f" (sha256 {digest})"
+        return {"action": "approve", "rule_key": "opensop_run:" + key,
+                "message": f"OpenSOP will run the script steps of {process}{shown} in {cwd} with your "
+                           f"permissions, with inputs {inputs[:800]}.{_forwarded(_env_names(file))}"}
+    if tool_name in ("sop_submit", "sop_retry"):
+        # Submitting or retrying continues the run, so its script steps execute. A run this
+        # profile didn't approve (started elsewhere, or a same-id run in another folder) asks first.
+        run_id = None
         try:
-            with open(os.path.join(_workdir(args), process), "rb") as f:
-                digest = " (sha256 " + hashlib.sha256(f.read()).hexdigest()[:12] + ")"
-        except OSError:
-            digest = ""
-        return {"action": "approve",
-                "message": f"OpenSOP will run the script steps of {process}{digest} in {_workdir(args)} "
-                           f"with your permissions, with inputs {json.dumps(args.get('inputs') or {})[:800]}."}
+            run_id, cwd = _resolve(args, {"session_id": session_id})
+            if not run_id:
+                return None  # the tool reports the missing run itself
+            st, _ = _status(run_id, cwd)
+            run_dir = (st or {}).get("run_dir")
+            if _approved(run_id, run_dir):
+                return None
+            snap = _snapshot(run_dir)
+            return {"action": "approve",
+                    "rule_key": "opensop_continue:" + hashlib.sha256(str(run_dir or run_id).encode()).hexdigest()[:16],
+                    "message": f"OpenSOP will continue run {run_id} (run folder {run_dir or 'unknown'}, process "
+                               f"sha256 {_digest(snap)}), and its script steps will run with your permissions. "
+                               f"This Hermes profile did not start this run.{_forwarded(_env_names(snap))}"}
+        except Exception:  # a hook that raises lets the tool run; ask instead
+            return {"action": "approve", "rule_key": "opensop_continue:error",
+                    "message": f"OpenSOP will continue run {run_id or 'unknown'}, "
+                                                    "and its script steps will run with your permissions."}
     if tool_name in TOOL_NAMES:
         return None
     bound = _bound(session_id) or {}

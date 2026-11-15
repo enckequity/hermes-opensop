@@ -19,3 +19,8 @@ provides_hooks:
   - pre_verify
   - pre_tool_call
   - post_compaction
+config_schema:
+  timeout:
+    type: int
+    default: 1800
+    description: "Seconds one sop_* tool call may run script steps before the CLI and its child processes are stopped"
