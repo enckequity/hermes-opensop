@@ -27,8 +27,7 @@ NOT_AGENT_WORK = HUMAN_REASONS | {"waiting_for_callback"}
 OPEN_STATES = ("waiting", "failed", "running", "interrupted")
 MAX_CONTEXT_CHARS = 1500
 MIN_CLI = (0, 10, 0)
-DECIDED_BY = "agent:hermes"
-INSTALL_URL = "https://github.com/opensop/opensop#quickstart-60-seconds"
+DECIDED_BY = "agent:assistant"  # receipts name the role, not the host app
 # Run-folder files an agent never needs to touch while it works a run.
 RUN_FILES = ("manifest.json", "audit.jsonl", "context.json", "process.snapshot.json", "fault.json")
 
@@ -46,7 +45,7 @@ def _cli():
     if _cli_checked and _cli_checked[0] == exe:
         return _cli_checked
     if not exe:
-        return None, f"opensop is not on PATH. Install it: {INSTALL_URL}"
+        return None, "opensop is not on PATH. The CLI is installed with the workspace image; ask its administrator."
     try:
         first = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10).stdout.split("\n")[0]
         have = tuple(int(x) for x in re.search(r"(\d+)\.(\d+)\.(\d+)", first).groups())
@@ -54,7 +53,7 @@ def _cli():
         have = (0, 0, 0)
     err = None if have >= MIN_CLI else (
         f"opensop {'.'.join(map(str, have))} is too old; this plugin needs "
-        f"{'.'.join(map(str, MIN_CLI))} or later. Run: opensop upgrade")
+        f"{'.'.join(map(str, MIN_CLI))} or later. The CLI is pinned with the workspace, so ask its administrator to update it.")
     _cli_checked = (exe, err)
     return _cli_checked
 
@@ -447,6 +446,9 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
     return None
 
 
+# The CLI is pinned with the workspace image: `opensop upgrade` would replace it with an unreviewed
+# download from the network, so the terminal refuses it (the same linear flag pattern as submit).
+_UPGRADE = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+upgrade\b")
 # Each flag matches one way only (`-\S*`), and at most 32 of them, so this stays linear on every
 # terminal command (`-opensop -opensop …` would otherwise rescan the rest from each word).
 _SUBMIT = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+submit\b([^;&|\n]*)")
@@ -509,7 +511,7 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
                     "rule_key": "opensop_continue:" + hashlib.sha256(str(run_dir or run_id).encode()).hexdigest()[:16],
                     "message": f"OpenSOP will continue run {run_id} (run folder {run_dir or 'unknown'}, process "
                                f"sha256 {_digest(snap)}), and its script steps will run with your permissions. "
-                               f"This Hermes profile did not start this run.{_forwarded(_env_names(snap))}"}
+                               f"This workspace did not start this run.{_forwarded(_env_names(snap))}"}
         except Exception:  # a hook that raises lets the tool run; ask instead
             return {"action": "approve", "rule_key": "opensop_continue:error",
                     "message": f"OpenSOP will continue run {run_id or 'unknown'}, "
@@ -524,6 +526,9 @@ def _pre_tool_call(tool_name=None, args=None, session_id=None, **kwargs):
         return _block(f"run {bound['run_id']}'s run folder is its record; the agent works through the "
                       "sop_* tools instead (sop_status shows the run).")
     command = str(args.get("command") or "") if tool_name == "terminal" else ""
+    if _UPGRADE.search(command):
+        return _block("the opensop CLI is pinned with this workspace and is not upgraded from here. "
+                      "Ask the workspace administrator for a newer version.")
     m = _SUBMIT.search(command)
     if not m:
         return None

@@ -223,7 +223,7 @@ def test_agent_submissions_are_recorded_as_the_agent(env, tmp_path):
     call(ctx, "sop_submit", {"outputs": {"summary": big}})
     audit = Path(v["run_dir"]) / "audit.jsonl"
     rec = [json.loads(line) for line in audit.read_text().splitlines() if '"change"' in line][-1]
-    assert rec["status"] == "completed" and rec.get("decided_by") == "agent:hermes", rec
+    assert rec["status"] == "completed" and rec.get("decided_by") == "agent:assistant", rec
 
 
 def test_seat_belts_around_the_run_folder(env):
@@ -276,7 +276,7 @@ def test_old_cli_is_refused_with_the_fix(env, tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
     monkeypatch.setattr(mod, "_cli_checked", None)
     v = call(ctx, "sop_run", {"process": str(EXAMPLE)})
-    assert "too old" in v["error"] and "opensop upgrade" in v["error"], v
+    assert "too old" in v["error"] and "opensop upgrade" not in v["error"], v
 
 
 def test_a_rejected_change_fails_the_run(env):
@@ -392,3 +392,21 @@ def test_submit_and_retry_on_an_outside_run_ask_first(env, tmp_path, monkeypatch
     monkeypatch.setattr(mod, "_status", lambda run_id, cwd: 1 / 0)
     r = guard(tool_name="sop_retry", args={"run_id": mine}, session_id="s1")
     assert r["action"] == "approve" and r["rule_key"] == "opensop_continue:error"
+
+
+def test_terminal_refuses_cli_upgrade(env):
+    mod, ctx, _ = env
+    pre = ctx.hooks["pre_tool_call"]
+    for cmd in ("opensop upgrade", "opensop --json upgrade --pin 0.11.0", "cd x && opensop upgrade --dry-run",
+                "/usr/local/bin/opensop upgrade", "'opensop' upgrade"):
+        r = pre(tool_name="terminal", args={"command": cmd}, session_id="u")
+        assert r and r["action"] == "block" and "pinned" in r["message"], (cmd, r)
+    for cmd in ("opensop status abc", "echo upgrade", "pip install --upgrade opensop-docs"):
+        assert pre(tool_name="terminal", args={"command": cmd}, session_id="u") is None, cmd
+
+
+def test_tool_text_names_no_host_app(env):
+    mod, ctx, _ = env
+    text = json.dumps([s for _, s in mod.TOOLS])
+    assert "hermes" not in text.lower()
+    assert "hermes" not in mod.DECIDED_BY.lower()
