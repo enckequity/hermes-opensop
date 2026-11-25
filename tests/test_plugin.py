@@ -398,7 +398,7 @@ def test_terminal_refuses_cli_upgrade(env):
     mod, ctx, _ = env
     pre = ctx.hooks["pre_tool_call"]
     for cmd in ("opensop upgrade", "opensop --json upgrade --pin 0.11.0", "cd x && opensop upgrade --dry-run",
-                "/usr/local/bin/opensop upgrade", "'opensop' upgrade"):
+                "/usr/local/bin/opensop upgrade", "'opensop' upgrade", 'opensop "upgrade"'):
         r = pre(tool_name="terminal", args={"command": cmd}, session_id="u")
         assert r and r["action"] == "block" and "pinned" in r["message"], (cmd, r)
     for cmd in ("opensop status abc", "echo upgrade", "pip install --upgrade opensop-docs"):

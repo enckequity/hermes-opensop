@@ -448,7 +448,7 @@ def _pre_verify(session_id=None, attempt=0, **kwargs):
 
 # The CLI is pinned with the workspace image: `opensop upgrade` would replace it with an unreviewed
 # download from the network, so the terminal refuses it (the same linear flag pattern as submit).
-_UPGRADE = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+upgrade\b")
+_UPGRADE = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+['\"]?upgrade\b")
 # Each flag matches one way only (`-\S*`), and at most 32 of them, so this stays linear on every
 # terminal command (`-opensop -opensop …` would otherwise rescan the rest from each word).
 _SUBMIT = re.compile(r"\bopensop\b['\"]?(?:\s+-\S*){0,32}\s+submit\b([^;&|\n]*)")
